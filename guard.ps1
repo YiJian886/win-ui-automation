@@ -121,6 +121,9 @@ public class InputGuard
 
     static volatile uint _lastRealInputTick;
     static volatile int  _realEventCount;
+    static volatile IntPtr _lastRealForeground = IntPtr.Zero;
+
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
 
     static IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam)
     {
@@ -131,6 +134,9 @@ public class InputGuard
             {
                 _lastRealInputTick = GetTickCount();
                 _realEventCount++;
+                // 真人正在操作时，前台窗口就是"他的窗口"。后面要把焦点还给他，
+                // 还的就是这个 —— 而不是"上次谁在前台"（那可能是我们自己抢的）。
+                _lastRealForeground = GetForegroundWindow();
             }
         }
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
@@ -145,6 +151,7 @@ public class InputGuard
             {
                 _lastRealInputTick = GetTickCount();
                 _realEventCount++;
+                _lastRealForeground = GetForegroundWindow();
             }
         }
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
@@ -176,6 +183,12 @@ public class InputGuard
     public static uint NowTick() { return GetTickCount(); }
 
     public static void ResetCounter() { _realEventCount = 0; _lastRealInputTick = GetTickCount(); }
+
+    // 真人最后一次操作时，前台是哪个窗口。没见过真人输入就返回 0。
+    public static IntPtr RealForeground()
+    {
+        return _lastRealForeground;
+    }
 
     public static int LastRealEventAgeMs()
     {
@@ -220,19 +233,29 @@ function Read-State {
     if (Test-Path $StatePath) {
         try {
             $o = Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $uw = 0
+            if ($o.PSObject.Properties['UserWindow']) { $uw = [int64]$o.UserWindow }
             return [pscustomobject]@{
                 InjectTick = [uint32]$o.InjectTick
                 HumanTick  = [uint32]$o.HumanTick
+                UserWindow = [int64]$uw
             }
         } catch { }
     }
-    return [pscustomobject]@{ InjectTick = [uint32]0; HumanTick = [uint32]0 }
+    return [pscustomobject]@{ InjectTick = [uint32]0; HumanTick = [uint32]0; UserWindow = [int64]0 }
 }
 
 function Write-State {
-    param([uint32]$InjectTick, [uint32]$HumanTick)
-    [pscustomobject]@{ InjectTick = $InjectTick; HumanTick = $HumanTick } |
-        ConvertTo-Json -Compress | Set-Content -Path $StatePath -Encoding UTF8
+    param([uint32]$InjectTick, [uint32]$HumanTick, [int64]$UserWindow = 0)
+    if ($UserWindow -eq 0) {
+        # 没传就沿用原来的值，别把记录冲掉
+        $UserWindow = (Read-State).UserWindow
+    }
+    [pscustomobject]@{
+        InjectTick = $InjectTick
+        HumanTick  = $HumanTick
+        UserWindow = $UserWindow
+    } | ConvertTo-Json -Compress | Set-Content -Path $StatePath -Encoding UTF8
 }
 
 # tick 是 32 位会回绕的。直接用 [uint32]($Now - $Then) 在 $Then > $Now 时会算出负数，
@@ -362,8 +385,22 @@ if (-not $Quiet) {
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $passed = $false
 
+$lastRecordedWindow = [int64](Read-State).UserWindow
+
 while ($sw.Elapsed.TotalMilliseconds -lt $timeoutMs) {
     [InputGuard]::Pump()
+
+    # 钩子看到真人操作了 —— 那一刻的前台窗口就是"他的窗口"，记下来，
+    # 之后 ui.ps1 要把焦点还给他时用的就是这个。
+    $rf = [InputGuard]::RealForeground()
+    if ($rf -ne [IntPtr]::Zero) {
+        $rfv = $rf.ToInt64()
+        if ($rfv -ne $lastRecordedWindow) {
+            $stNow = Read-State
+            Write-State -InjectTick $stNow.InjectTick -HumanTick $stNow.HumanTick -UserWindow $rfv
+            $lastRecordedWindow = $rfv
+        }
+    }
 
     # 钩子见过真人输入就按钩子算，否则退回状态文件推算的值
     $realAge = [InputGuard]::LastRealEventAgeMs()

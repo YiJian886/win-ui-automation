@@ -119,6 +119,12 @@ param(
     [Parameter(ParameterSetName = 'Batch')]
     [switch]$IgnoreErrors,
 
+    # 告诉工具「哪个窗口是你的」，自动化跑完会把焦点还给它。留空则只靠钩子观察。
+    [string]$HomeWindow,
+
+    # 单独把焦点还回去，不做别的。收尾时用。
+    [switch]$RestoreFocus,
+
     # 批量跑完不把焦点还回原来的窗口（默认会还）
     [switch]$NoRestoreFocus,
 
@@ -424,6 +430,36 @@ function Find-TargetWindow {
 # 自动化跟人抢鼠标是很讨厌的事，所以任何注入键鼠的操作动手之前，
 # 都先确认真人已经有一段时间没碰过电脑了。真人在用就等，等不到就中止。
 # 只读操作（-List / -FindElement）不过闸，因为它们不碰鼠标键盘。
+# ---------------- 状态文件读写（跟 guard.ps1 共用同一个文件）----------------
+function Get-GuardState {
+    $statePath = Join-Path $env:TEMP 'dsh-ui-guard.json'
+    $s = [pscustomobject]@{
+        InjectTick = [uint32]0
+        HumanTick  = [uint32]0
+        UserWindow = [int64]0
+    }
+    if (Test-Path $statePath) {
+        try {
+            $o = Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($o.PSObject.Properties['InjectTick']) { $s.InjectTick = [uint32]$o.InjectTick }
+            if ($o.PSObject.Properties['HumanTick'])  { $s.HumanTick  = [uint32]$o.HumanTick }
+            if ($o.PSObject.Properties['UserWindow']) { $s.UserWindow = [int64]$o.UserWindow }
+        } catch { }
+    }
+    return $s
+}
+
+function Set-GuardState {
+    param($State)
+    $statePath = Join-Path $env:TEMP 'dsh-ui-guard.json'
+    [pscustomobject]@{
+        InjectTick = $State.InjectTick
+        HumanTick  = $State.HumanTick
+        UserWindow = $State.UserWindow
+    } | ConvertTo-Json -Compress | Set-Content -Path $statePath -Encoding UTF8
+}
+
+
 function Invoke-InputGuard {
     if ($GuardSeconds -le 0) { return }
 
@@ -444,39 +480,72 @@ function Invoke-InputGuard {
     if ($code -ne 0) {
         throw "操作保护：$GuardTimeout 秒内检测到你一直在用电脑，本次操作已中止。确认不用了可以加 -GuardSeconds 0 跳过。"
     }
-
 }
 
 # 注入之前记账，告诉状态文件"接下来这几下是我干的"。
 # 必须紧挨着注入动作调用：中间隔太久的话，下次判断就会把这一下
 # 误认成真人操作，白白多等一整个静默期。
 function Set-InjectMark {
-    $statePath = Join-Path $env:TEMP 'dsh-ui-guard.json'
+    $s = Get-GuardState
     $now  = [UiCap]::GetTickCount()
     $last = [UiCap]::LastInputTick()
 
-    $injectTick = [uint32]0
-    $humanTick  = [uint32]0
-    if (Test-Path $statePath) {
-        try {
-            $o = Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $injectTick = [uint32]$o.InjectTick
-            $humanTick  = [uint32]$o.HumanTick
-        } catch { }
-    }
-
     # 上一次输入如果不在我上次记账之后的 600ms 内，那就不是自己刚发的，是真人。
     # 这个窗口敢开这么小，是因为记账已经挪到紧挨注入了。
-    if ($last -ne 0 -and $injectTick -ne 0) {
-        $d = [int64]$last - [int64]$injectTick
+    if ($last -ne 0 -and $s.InjectTick -ne 0) {
+        $d = [int64]$last - [int64]$s.InjectTick
         if ($d -lt 0) { $d += 4294967296 }
-        if ($d -gt 600) { $humanTick = $last }
+        if ($d -gt 600) { $s.HumanTick = $last }
     }
 
-    [pscustomobject]@{ InjectTick = $now; HumanTick = $humanTick } |
-        ConvertTo-Json -Compress | Set-Content -Path $statePath -Encoding UTF8
+    $s.InjectTick = $now
+    Set-GuardState -State $s
 }
 
+# 读"真人最后操作的那个窗口"。
+# 注意这跟"上次谁在前台"是两回事：后者可能是我们自己抢来的，照着还原就会
+# 把自己锁死在目标程序里出不来。
+function Get-UserWindow {
+    $statePath = Join-Path $env:TEMP 'dsh-ui-guard.json'
+    if (-not (Test-Path $statePath)) { return [IntPtr]::Zero }
+    try {
+        $o = Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($o.PSObject.Properties['UserWindow'] -and [int64]$o.UserWindow -ne 0) {
+            return [IntPtr][int64]$o.UserWindow
+        }
+    } catch { }
+    return [IntPtr]::Zero
+}
+
+# 把焦点还给真人。优先用记录下来的"他的窗口"，没有就退回调用方给的值。
+# 你的窗口在哪？
+#   优先用 guard 钩子观察到的值（真人操作时的前台窗口，最可信）；
+#   其次用配置里写死的窗口标题。
+# 之所以不猜"上次谁在前台"，是因为那可能是我们自己抢来的，
+# 照着还原会把自己锁死在目标程序里出不来。
+function Get-HomeWindowHandle {
+    $cfgPath = Join-Path $env:LOCALAPPDATA 'win-ui-automation\config.json'
+    if (-not (Test-Path $cfgPath)) { return [IntPtr]::Zero }
+    try {
+        $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $cfg.HomeWindow) { return [IntPtr]::Zero }
+        $wins = [UiCap]::ListWindows($true) | Where-Object { $_.Title -match $cfg.HomeWindow }
+        if ($wins) { return (@($wins | Sort-Object { -($_.W * $_.H) })[0]).Handle }
+    } catch { }
+    return [IntPtr]::Zero
+}
+
+function Restore-UserFocus {
+    if ($NoRestoreFocus) { return }
+
+    $h = [IntPtr](Get-GuardState).UserWindow
+    if ($h -eq [IntPtr]::Zero) { $h = Get-HomeWindowHandle }
+    if ($h -eq [IntPtr]::Zero) { return }
+    if ([UiCap]::GetForegroundWindow() -eq $h) { return }
+
+    [void][UiCap]::ForceActivate($h)
+    Start-Sleep -Milliseconds 120
+}
 # ---------------------------------------------------------------- -List
 if ($List) {
     $wins = [UiCap]::ListWindows([bool]$All)
@@ -1125,10 +1194,9 @@ if ($Script -or $ScriptFile) {
 
     # 不管成功还是失败，都把焦点还回任务开始前的窗口。
     # 这一步是用户明确要求的：自动化跑完不要把人晾在别的程序里。
-    if (-not $NoRestoreFocus -and $startFg -ne [IntPtr]::Zero) {
-        [void][UiCap]::ForceActivate($startFg)
-        Start-Sleep -Milliseconds 250
-        Write-Host "已把焦点还回任务开始前的窗口。"
+    if (-not $NoRestoreFocus) {
+        Restore-UserFocus -Fallback $startFg
+        Write-Host "已把焦点还回你的窗口。"
     }
 
     if ($batchAborted) { exit 1 }
@@ -1140,21 +1208,52 @@ if ($Script -or $ScriptFile) {
     exit 0
 }
 
-if ($Type) { Invoke-Type; return }
+# ---------------------------------------------------------------- -RestoreFocus
+# 单独把焦点还回去。自动化任务收尾时明确调一下，比指望调用方记得收尾可靠。
+if ($RestoreFocus) {
+    $before = [UiCap]::GetForegroundWindow()
+    Restore-UserFocus
+    Start-Sleep -Milliseconds 200
+    $after = [UiCap]::GetForegroundWindow()
+    [pscustomobject]@{
+        切换前 = ('0x{0:X}' -f $before.ToInt64())
+        切换后 = ('0x{0:X}' -f $after.ToInt64())
+        已还原 = ($before -ne $after)
+    }
+    return
+}
+# ---------------------------------------------------------------- -HomeWindow
+# 设定「哪个窗口是你的」。设一次就行，之后自动化跑完都会把焦点还回去。
+if ($HomeWindow) {
+    $cfgPath = Join-Path $env:LOCALAPPDATA 'win-ui-automation\config.json'
+    $dir = Split-Path -Parent $cfgPath
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    [pscustomobject]@{ HomeWindow = $HomeWindow } |
+        ConvertTo-Json | Set-Content -Path $cfgPath -Encoding UTF8
+
+    $wins = [UiCap]::ListWindows($true) | Where-Object { $_.Title -match $HomeWindow }
+    [pscustomobject]@{
+        已保存   = $cfgPath
+        匹配模式 = $HomeWindow
+        匹配情况 = if ($wins) { "$($wins.Count) 个窗口，最大的是 '$((@($wins | Sort-Object { -($_.W * $_.H) })[0]).Title)'" } else { '没匹配到，检查标题写对没有' }
+    }
+    return
+}
+if ($Type) { Invoke-Type; Restore-UserFocus; return }
 
 # ---------------------------------------------------------------- -Key
-if ($Key) { Invoke-Key; return }
+if ($Key) { Invoke-Key; Restore-UserFocus; return }
 
 # ---------------------------------------------------------------- -Drag
-if ($Drag) { Invoke-Drag; return }
+if ($Drag) { Invoke-Drag; Restore-UserFocus; return }
 
 # ---------------------------------------------------------------- -ScrollAt
 # 只移动光标 + 滚轮，不点击。用于在长列表（如评论区）里翻页，
 # 避免点击落在列表项上引发副作用。
-if ($ScrollAt) { Invoke-ScrollAt; return }
+if ($ScrollAt) { Invoke-ScrollAt; Restore-UserFocus; return }
 
 # ---------------------------------------------------------------- -ClickAt
-if ($ClickAt) { Invoke-ClickAt; return }
+if ($ClickAt) { Invoke-ClickAt; Restore-UserFocus; return }
 
 # ---------------------------------------------------------------- 定位：控件树
 # 用 UI Automation 读窗口的控件树。靠谱的程序（Win32/WinUI/浏览器）都能读出
@@ -1171,6 +1270,6 @@ if ($ClickAt) { Invoke-ClickAt; return }
 if ($FindElement) { Invoke-FindElement; return }
 
 # ---------------------------------------------------------------- -ClickElement
-if ($ClickElement) { Invoke-ClickElement; return }
+if ($ClickElement) { Invoke-ClickElement; Restore-UserFocus; return }
 
 Write-Host "没有指定操作。用 -List / -Activate / -ClickAt / -Type / -Key / -Drag / -ScrollAt / -FindElement / -ClickElement，或看 .EXAMPLE"
