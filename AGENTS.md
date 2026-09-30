@@ -1,4 +1,4 @@
-﻿# AGENTS.md
+# AGENTS.md
 
 给在这个仓库里干活的 AI agent 看的。人也可以读。
 

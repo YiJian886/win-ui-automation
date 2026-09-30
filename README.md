@@ -1,4 +1,4 @@
-﻿# win-ui-automation
+# win-ui-automation
 
 三个 PowerShell 脚本，用来给任意 Windows 桌面程序截图、找控件、点鼠标、敲键盘。纯 .NET + Win32 调用，默认不需要装任何东西。
 
