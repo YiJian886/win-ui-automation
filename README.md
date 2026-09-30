@@ -118,7 +118,8 @@ screenshot .\shots\result.png
 | 动词 | 例子 | 说明 |
 |---|---|---|
 | `window` | `window 记事本` | 切换后面操作的目标窗口 |
-| `activate` | `activate 记事本` | 还原 + 置前 + 抢焦点 |
+| `activate` | `activate 记事本` | 还原 + 置前 + 抢焦点（并把它作为后续操作的目标窗口） |
+| `focus` | `focus 记事本` | 只切焦点，不改变后续操作的目标窗口 |
 | `click` | `click 900,600` | 点窗口内相对坐标 |
 | `dblclick` | `dblclick 900,600` | 双击 |
 | `rightclick` | `rightclick 900,600` | 右键 |
@@ -134,6 +135,10 @@ screenshot .\shots\result.png
 | `guard` | `guard 0` | 改操作保护阈值（0 = 关掉） |
 | `screenshot` | `screenshot a.png` | 截图 |
 | `echo` | `echo 到这里了` | 打一行日志 |
+
+**跑完会把焦点还回去。** 批量模式在开始时记下你正在看哪个窗口，结束时自动切回去
+（哪怕中途激活过别的程序）。自动化把人的窗口抢走、跑完就不管了，是很讨厌的事。
+不想要这个行为加 `-NoRestoreFocus`。
 
 默认遇到错误就中止并报出是第几行。要跳过错误继续跑，加 `-IgnoreErrors`。
 

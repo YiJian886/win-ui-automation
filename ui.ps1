@@ -119,6 +119,9 @@ param(
     [Parameter(ParameterSetName = 'Batch')]
     [switch]$IgnoreErrors,
 
+    # 批量跑完不把焦点还回原来的窗口（默认会还）
+    [switch]$NoRestoreFocus,
+
     # 操作保护：动手之前先确认真人已经静默这么多秒。0 = 关闭保护。
     [double]$GuardSeconds = 10,
 
@@ -952,6 +955,11 @@ if ($Script -or $ScriptFile) {
     $batchWindow = $Window
     $batchIndex = 0
     $batchFailed = 0
+    $batchAborted = $false
+
+    # 记下任务开始前你正在看哪个窗口。跑完要还回去，
+    # 省得每次自动化折腾完，还得你自己手动切回对话界面。
+    $startFg = [UiCap]::GetForegroundWindow()
 
     Write-Host "批量执行开始，共 $($lines.Count) 行"
 
@@ -973,6 +981,14 @@ if ($Script -or $ScriptFile) {
                 'window' {
                     $batchWindow = $arg
                     Write-Host "  [$batchIndex] 目标窗口 -> $arg"
+                }
+
+                'focus' {
+                    $wins = Find-TargetWindow -Pattern $arg
+                    if (-not $wins) { throw "没有匹配 '$arg' 的窗口" }
+                    [void][UiCap]::ForceActivate($wins[0].Handle)
+                    Start-Sleep -Milliseconds 300
+                    Write-Host "  [$batchIndex] 焦点切到 $arg"
                 }
 
                 'activate' {
@@ -1101,11 +1117,21 @@ if ($Script -or $ScriptFile) {
             Write-Warning "第 $batchIndex 行失败（$line）: $($_.Exception.Message)"
             if (-not $IgnoreErrors) {
                 Write-Host "批量执行中止于第 $batchIndex 行。要跳过错误继续跑，加 -IgnoreErrors。"
-                exit 1
+                $batchAborted = $true
+                break
             }
         }
     }
 
+    # 不管成功还是失败，都把焦点还回任务开始前的窗口。
+    # 这一步是用户明确要求的：自动化跑完不要把人晾在别的程序里。
+    if (-not $NoRestoreFocus -and $startFg -ne [IntPtr]::Zero) {
+        [void][UiCap]::ForceActivate($startFg)
+        Start-Sleep -Milliseconds 250
+        Write-Host "已把焦点还回任务开始前的窗口。"
+    }
+
+    if ($batchAborted) { exit 1 }
     if ($batchFailed -gt 0) {
         Write-Host "批量执行结束，$batchFailed 行失败（已按 -IgnoreErrors 跳过）。"
         exit 1
