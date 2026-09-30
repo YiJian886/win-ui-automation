@@ -253,6 +253,8 @@ $env:OMNIPARSER_URL = 'http://127.0.0.1:7860'
 
 **说清楚代价**：OmniParser 官方 `requirements.txt` 拉了 torch、torchvision、easyocr、paddlepaddle、paddleocr、transformers、ultralytics、opencv……外加一堆跟推理无关的（anthropic、boto3、groq、gradio、streamlit）。几个 GB，而且钉在 `numpy==1.26.4`、`openai==1.3.5` 这种老版本上。真要装建议单独开 Python 3.12 的 conda/uv 环境，别往系统 Python 里灌。
 
+> 如果你是用 AI agent 来跑或改这套东西，先看 [AGENTS.md](AGENTS.md) —— 那里有针对 agent 的规矩和最容易翻车的地方。
+
 ## 怎么跑
 
 系统默认的执行策略是 Restricted，直接跑 .ps1 会被拦。逐次加 Bypass 就行，不用去改系统设置：
