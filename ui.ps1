@@ -109,6 +109,12 @@ param(
 
     [string]$OmniParserUrl = $(if ($env:OMNIPARSER_URL) { $env:OMNIPARSER_URL } else { 'http://127.0.0.1:7860' }),
 
+    # 操作保护：动手之前先确认真人已经静默这么多秒。0 = 关闭保护。
+    [double]$GuardSeconds = 10,
+
+    # 等真人静默最多等多久，超时就中止本次操作
+    [double]$GuardTimeout = 120,
+
     [int]$DelayMs = 120
 )
 
@@ -388,6 +394,36 @@ function Find-TargetWindow {
     return @($wins | Sort-Object { -($_.W * $_.H) })
 }
 
+# 操作保护闸。
+# 自动化跟人抢鼠标是很讨厌的事，所以任何注入键鼠的操作动手之前，
+# 都先确认真人已经有一段时间没碰过电脑了。真人在用就等，等不到就中止。
+# 只读操作（-List / -FindElement）不过闸，因为它们不碰鼠标键盘。
+function Invoke-InputGuard {
+    if ($GuardSeconds -le 0) { return }
+
+    $guard = Join-Path $PSScriptRoot 'guard.ps1'
+    if (-not (Test-Path $guard)) {
+        Write-Warning "找不到 guard.ps1，本次操作没有保护。"
+        return
+    }
+
+    try {
+        & $guard -WaitIdle $GuardSeconds -Timeout $GuardTimeout -Quiet | Out-Null
+        $code = $LASTEXITCODE
+    } catch {
+        Write-Warning "操作保护执行异常，本次放行：$($_.Exception.Message)"
+        return
+    }
+
+    if ($code -ne 0) {
+        throw "操作保护：$GuardTimeout 秒内检测到你一直在用电脑，本次操作已中止。确认不用了可以加 -GuardSeconds 0 跳过。"
+    }
+
+    # 放行之后立刻记账：把"我要注入了"这件事写进状态文件，
+    # 下次判断时才知道某次输入是自己干的还是真人干的。
+    try { & $guard -MarkInject -Quiet | Out-Null } catch { }
+}
+
 # ---------------------------------------------------------------- -List
 if ($List) {
     $wins = [UiCap]::ListWindows([bool]$All)
@@ -429,6 +465,7 @@ if ($Activate) {
 
 # ---------------------------------------------------------------- -Type
 if ($Type) {
+    Invoke-InputGuard
     [UiCap]::TypeText($Type)
     Start-Sleep -Milliseconds $DelayMs
     [pscustomobject]@{ Typed = $Type; Length = $Type.Length }
@@ -437,6 +474,7 @@ if ($Type) {
 
 # ---------------------------------------------------------------- -Key
 if ($Key) {
+    Invoke-InputGuard
     $map = @{
         'enter'=13; 'tab'=9; 'esc'=27; 'escape'=27; 'space'=32; 'backspace'=8; 'delete'=46; 'del'=46
         'up'=38; 'down'=40; 'left'=37; 'right'=39; 'home'=36; 'end'=35; 'pageup'=33; 'pagedown'=34
@@ -496,6 +534,7 @@ if ($Key) {
 
 # ---------------------------------------------------------------- -Drag
 if ($Drag) {
+    Invoke-InputGuard
     $p = Resolve-Point -Spec $Drag -Count 4
     [UiCap]::MoveTo($p[0], $p[1])
     Start-Sleep -Milliseconds 150
@@ -522,6 +561,7 @@ if ($Drag) {
 # 只移动光标 + 滚轮，不点击。用于在长列表（如评论区）里翻页，
 # 避免点击落在列表项上引发副作用。
 if ($ScrollAt) {
+    Invoke-InputGuard
     $pt = Resolve-Point -Spec $ScrollAt -Count 2
     $sx = $pt[0]; $sy = $pt[1]
 
@@ -556,6 +596,7 @@ if ($ScrollAt) {
 
 # ---------------------------------------------------------------- -ClickAt
 if ($ClickAt) {
+    Invoke-InputGuard
     $pt = Resolve-Point -Spec $ClickAt -Count 2
     $x = $pt[0]; $y = $pt[1]
 
@@ -749,6 +790,7 @@ if ($FindElement) {
 
 # ---------------------------------------------------------------- -ClickElement
 if ($ClickElement) {
+    Invoke-InputGuard
     if (-not $Window) { throw '-ClickElement 需要配 -Window 指定在哪个窗口里点。' }
     $wins = Find-TargetWindow -Pattern $Window
     if (-not $wins) { throw "没有匹配 '$Window' 的窗口。" }

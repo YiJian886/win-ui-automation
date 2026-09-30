@@ -1,4 +1,4 @@
-# win-ui-automation
+﻿# win-ui-automation
 
 三个 PowerShell 脚本，用来给任意 Windows 桌面程序截图、找控件、点鼠标、敲键盘。纯 .NET + Win32 调用，默认不需要装任何东西。
 
@@ -60,6 +60,35 @@
 
 # 只移动鼠标 + 滚轮，不点击。翻长列表用这个，避免误触到列表项
 .\ui.ps1 -Window '记事本' -ScrollAt '300,400' -Scroll -5
+```
+
+### guard.ps1 —— 操作保护闸
+
+自动化跟人抢鼠标是很讨厌的事。`ui.ps1` 默认会先调它，确认真人已经有一段时间
+没碰过电脑才动手。
+
+```powershell
+# 人现在在用电脑吗？真人静默多久了？
+.\guard.ps1 -Status
+
+# 等到真人连续 10 秒没碰键鼠
+.\guard.ps1 -WaitIdle 10
+
+# 观察 5 秒，看有没有真人输入（验证钩子有没有用）
+.\guard.ps1 -Watch 5
+```
+
+`ui.ps1` 里对应两个开关：
+
+```powershell
+# 默认就是这样：动手前先等真人静默 10 秒
+.\ui.ps1 -Window '记事本' -ClickElement '保存'
+
+# 确实没人在用，跳过保护
+.\ui.ps1 -Window '记事本' -ClickElement '保存' -GuardSeconds 0
+
+# 改等待时长 / 超时
+.\ui.ps1 -Window '记事本' -ClickElement '保存' -GuardSeconds 5 -GuardTimeout 60
 ```
 
 ### vision.ps1 —— 从画面里认元素
@@ -209,6 +238,33 @@ $parsed = (@($json) -join "`n") | ConvertFrom-Json
 ```
 
 单独在命令行跑 `vision.ps1` 不会遇到这个问题，只有进程内互相调用才会，所以特别隐蔽。
+
+### 10. 分清"人操作"和"自己注入的操作"
+
+做操作保护的时候需要的：怎么知道用户正在用电脑？
+
+- `GetLastInputInfo` 能给"上次输入是多久以前"，但它**把 SendInput 注入的也算进去**，
+  所以自动化自己点一下，它立刻认为"刚刚有人操作"，会把自己无限卡住。
+- 正解是挂全局低级钩子（`WH_MOUSE_LL` / `WH_KEYBOARD_LL`），钩子事件的
+  `LLMHF_INJECTED` / `LLKHF_INJECTED` 标志位能区分来源。
+- 但钩子只有"装上之后"的视野，没有历史，而每次调用都是新进程。
+  所以再配一个状态文件记录"注入时刻"和"已确认的真人输入时刻"，
+  下次就能算出真人到底静默了多久，不用每次白等。
+
+实测：观察 10 秒期间注入 3 次点击，钩子报告"没有真人输入"，过滤是准的。
+
+### 11. tick 是无符号 32 位，会回绕
+
+`GetTickCount()` 返回 `uint32`，49.7 天回绕一次。算时间差时如果直接
+`[uint32]($now - $then)`，一旦 `$then > $now` 就会算出负数，强转 `uint32` 抛异常。
+在 `$ErrorActionPreference = 'Stop'` 下这个异常会把整个等待循环打断，
+表现是"保护莫名其妙直接超时"。
+
+```powershell
+$d = [int64]$Now - [int64]$Then
+if ($d -lt 0) { $d += 4294967296 }
+return [uint32]($d % 4294967296)
+```
 
 ## 类似的轮子
 
