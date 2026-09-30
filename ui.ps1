@@ -91,8 +91,23 @@ param(
     [Parameter(ParameterSetName = 'ScrollAt', Mandatory = $true)]
     [string]$ScrollAt,
 
+    [Parameter(ParameterSetName = 'FindElement', Mandatory = $true)]
+    [string]$FindElement,
+
+    [Parameter(ParameterSetName = 'ClickElement', Mandatory = $true)]
+    [string]$ClickElement,
+
     # 不绑定参数集 = 所有模式都可用
     [int]$Scroll = 0,
+
+    # 定位策略：uia 只看控件树，vision 只看画面，auto 先控件树再画面
+    [ValidateSet('uia', 'vision', 'auto')]
+    [string]$Strategy = 'auto',
+
+    [ValidateSet('ocr', 'omniparser', 'auto')]
+    [string]$VisionBackend = 'ocr',
+
+    [string]$OmniParserUrl = $(if ($env:OMNIPARSER_URL) { $env:OMNIPARSER_URL } else { 'http://127.0.0.1:7860' }),
 
     [int]$DelayMs = 120
 )
@@ -585,4 +600,234 @@ if ($ClickAt) {
     return
 }
 
-Write-Host "没有指定操作。用 -List / -Activate / -ClickAt / -Type / -Key / -Drag / -Scroll，或看 .EXAMPLE"
+# ---------------------------------------------------------------- 定位：控件树
+# 用 UI Automation 读窗口的控件树。靠谱的程序（Win32/WinUI/浏览器）都能读出
+# 带名字和精确坐标的控件；Electron 壳默认关掉辅助功能，树是空的 —— 那就得靠
+# 下面的视觉兜底。
+function Get-UiaElements {
+    param([IntPtr]$Handle, [string]$Pattern)
+
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+    if (-not $root) { return @() }
+
+    $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition)
+
+    # 窗口自身的范围。页面里滚出可视区的元素坐标会是很小的负数，
+    # 同名文字一抓一大把，不过滤就会点到屏幕外面去。
+    $wr = [UiCap+RECT]::new()
+    [void][UiCap]::GetWindowRect($Handle, [ref]$wr)
+
+    $out = @()
+    foreach ($e in $all) {
+        try {
+            $name = $e.Current.Name
+            if (-not $name) { continue }
+
+            # 归一化后匹配，跟视觉那条路保持一致
+            $norm = $name -replace '\s+', ''
+            if ($norm -notmatch $Pattern -and $name -notmatch $Pattern) { continue }
+
+            $r = $e.Current.BoundingRectangle
+            # 有些元素宽高是 Infinity（虚拟化的列表容器），坐标没法用
+            if ([double]::IsInfinity($r.Width) -or [double]::IsInfinity($r.Height)) { continue }
+            if ($r.Width -le 0 -or $r.Height -le 0) { continue }
+
+            # 只留中心点落在窗口内的元素
+            $cx = $r.X + $r.Width / 2
+            $cy = $r.Y + $r.Height / 2
+            if ($cx -lt $wr.Left -or $cx -gt $wr.Right) { continue }
+            if ($cy -lt $wr.Top -or $cy -gt $wr.Bottom) { continue }
+
+            # 能不能直接 Invoke。能的话比模拟点击稳，被遮挡也不怕
+            $patObj = $null
+            $canInvoke = $false
+            try { $canInvoke = $e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$patObj) } catch { }
+
+            $out += [pscustomobject]@{
+                Source   = 'uia'
+                Type     = ($e.Current.ControlType.ProgrammaticName -replace 'ControlType\.', '')
+                Text     = $name
+                Norm     = $norm
+                Id       = $e.Current.AutomationId
+                X1       = [int]$r.X
+                Y1       = [int]$r.Y
+                X2       = [int]($r.X + $r.Width)
+                Y2       = [int]($r.Y + $r.Height)
+                X        = [int]($r.X + $r.Width / 2)
+                Y        = [int]($r.Y + $r.Height / 2)
+                W        = [int]$r.Width
+                H        = [int]$r.Height
+                Element  = $e
+                CanInvoke = $canInvoke
+            }
+        } catch { }
+    }
+    return $out
+}
+
+# ---------------------------------------------------------------- 定位：视觉
+# 截图 + 识别（Windows 自带 OCR 或 OmniParser），按文字找元素。
+# 返回的坐标是相对截图的，调用方负责加上窗口原点。
+function Get-VisionElements {
+    param([IntPtr]$Handle, [string]$Pattern, [string]$Backend, [string]$OmniUrl)
+
+    $vision = Join-Path $PSScriptRoot 'vision.ps1'
+    if (-not (Test-Path $vision)) { throw "同目录下找不到 vision.ps1，没法走视觉兜底。" }
+
+
+    $dir = Join-Path $PSScriptRoot 'shots'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $png = Join-Path $dir ("ui-vision-{0}.png" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+
+    # 用 PrintWindow 抓这个窗口，被遮挡也能抓到
+    $bmp = $null
+    $r = [UiCap+RECT]::new()
+    [void][UiCap]::GetWindowRect($Handle, [ref]$r)
+    $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top
+    if ($w -le 0 -or $h -le 0) { throw '窗口尺寸为 0，抓不到图。' }
+
+    Add-Type -AssemblyName System.Drawing
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $g.GetHdc()
+    $ok = [UiCap]::PrintWindow($Handle, $hdc, 2)
+    $g.ReleaseHdc($hdc)
+    $g.Dispose()
+    if (-not $ok) {
+        $bmp.Dispose()
+        $bmp = New-Object System.Drawing.Bitmap($w, $h)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.CopyFromScreen($r.Left, $r.Top, 0, 0, (New-Object System.Drawing.Size($w, $h)))
+        $g.Dispose()
+    }
+    $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+
+    $json = & $vision -Image $png -Match $Pattern -Backend $Backend -OmniParserUrl $OmniUrl -Json
+    # 脚本输出是多行字符串，PowerShell 捕获时会拆成字符串数组，先拼回去再解析
+    $parsed = (@($json) -join "`n") | ConvertFrom-Json
+    # 记住实际用了哪个后端（auto 会自己挑），好在结果里如实报告
+    $script:LastVisionBackend = $parsed.backend
+    if (-not $parsed.elements) { return @() }
+    return @($parsed.elements)
+}
+
+# ---------------------------------------------------------------- -FindElement
+if ($FindElement) {
+    if (-not $Window) { throw '-FindElement 需要配 -Window 指定在哪个窗口里找。' }
+    $wins = Find-TargetWindow -Pattern $Window
+    if (-not $wins) { throw "没有匹配 '$Window' 的窗口。" }
+    $w = $wins[0]
+
+    $found = @()
+    $used = ''
+
+    if ($Strategy -ne 'vision') {
+        $found = @(Get-UiaElements -Handle $w.Handle -Pattern $FindElement)
+        if ($found.Count) { $used = 'uia' }
+    }
+    if (-not $found -and $Strategy -ne 'uia') {
+        $found = @(Get-VisionElements -Handle $w.Handle -Pattern $FindElement -Backend $VisionBackend -OmniUrl $OmniParserUrl)
+        if ($found.Count) { $used = "vision/$VisionBackend" }
+    }
+
+    if (-not $found) {
+        Write-Host "没找到匹配 '$FindElement' 的元素（策略=$Strategy）。"
+        Write-Host "控件树空的窗口（比如 Electron 壳）本来就读不到，试试 -Strategy vision。"
+        return
+    }
+
+    Write-Verbose "命中来源: $used"
+    $found | Select-Object Source, Type,
+        @{ n = 'Text'; e = { if ($_.Text.Length -gt 40) { $_.Text.Substring(0, 40) + '…' } else { $_.Text } } },
+        X, Y, W, H | Format-Table -AutoSize
+    return
+}
+
+# ---------------------------------------------------------------- -ClickElement
+if ($ClickElement) {
+    if (-not $Window) { throw '-ClickElement 需要配 -Window 指定在哪个窗口里点。' }
+    $wins = Find-TargetWindow -Pattern $Window
+    if (-not $wins) { throw "没有匹配 '$Window' 的窗口。" }
+    $w = $wins[0]
+
+    $fgNow = [UiCap]::GetForegroundWindow()
+    if ($fgNow -ne $w.Handle) {
+        [UiCap]::ForceActivate($w.Handle) | Out-Null
+        Start-Sleep -Milliseconds 400
+        $w = ([UiCap]::ListWindows($true) | Where-Object { $_.Handle -eq $w.Handle })
+    }
+
+    $target = $null
+    $used = ''
+
+    if ($Strategy -ne 'vision') {
+        $uia = @(Get-UiaElements -Handle $w.Handle -Pattern $ClickElement)
+        if ($uia.Count) {
+            # 排序：能被 Invoke 的优先 -> 文字完全同名的优先 -> 面积小的优先
+            # （面积小通常意味着控件更具体；页面上同名的大块文本容器会排在后面）
+            $want = $ClickElement -replace '\s+', ''
+            $ranked = $uia | Sort-Object -Property @(
+                @{ Expression = { if ($_.CanInvoke) { 0 } else { 1 } } },
+                @{ Expression = { if ($_.Norm -eq $want) { 0 } else { 1 } } },
+                @{ Expression = { $_.W * $_.H } }
+            )
+            $target = $ranked[0]
+            $used = 'uia'
+        }
+    }
+
+    if (-not $target -and $Strategy -ne 'uia') {
+        # 注意要套 @()：函数返回单元素数组时 PowerShell 会展开成标量，标量的 .Count 取不到值
+        $vis = @(Get-VisionElements -Handle $w.Handle -Pattern $ClickElement -Backend $VisionBackend -OmniUrl $OmniParserUrl)
+        if ($vis.Count) {
+            $target = ($vis | Sort-Object { $_.W * $_.H })[0]
+            $used = "vision/$($script:LastVisionBackend)"
+        }
+    }
+
+    if (-not $target) {
+        throw "找不到 '$ClickElement'（策略=$Strategy）。用 -FindElement 先看看窗口里有什么。"
+    }
+
+    # UIA 给的是屏幕绝对坐标；视觉识别给的是图片内坐标，得加窗口原点
+    if ($used -eq 'uia') {
+        $ax = $target.X; $ay = $target.Y
+    } else {
+        $ax = $w.X + $target.X; $ay = $w.Y + $target.Y
+    }
+
+    $clicked = 'click'
+    if ($used -eq 'uia' -and $target.CanInvoke) {
+        # 能 Invoke 就直接触发，比模拟点击稳（被遮挡也不怕）
+        try {
+            $pattern = $target.Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            $pattern.Invoke()
+            $clicked = 'invoke'
+        } catch {
+            [UiCap]::MoveTo($ax, $ay)
+            Start-Sleep -Milliseconds 80
+            [UiCap]::Click($false, 1, 60)
+        }
+    } else {
+        [UiCap]::MoveTo($ax, $ay)
+        Start-Sleep -Milliseconds 80
+        [UiCap]::Click($false, 1, 60)
+    }
+
+    Start-Sleep -Milliseconds $DelayMs
+    [pscustomobject]@{
+        Matched = $ClickElement
+        Via     = $used
+        How     = $clicked
+        Text    = $target.Text
+        Type    = $target.Type
+        At      = "$ax,$ay"
+    }
+    return
+}
+
+Write-Host "没有指定操作。用 -List / -Activate / -ClickAt / -Type / -Key / -Drag / -ScrollAt / -FindElement / -ClickElement，或看 .EXAMPLE"
