@@ -134,8 +134,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 
-if (-not ('UiCap' -as [type])) {
-    Add-Type -TypeDefinition @'
+. (Join-Path $PSScriptRoot 'native.ps1')
+Import-NativeType -TypeName 'UiCap' -Source @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -400,7 +400,7 @@ public class UiCap
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
 }
 '@
-}
+
 
 # 必须在任何坐标运算之前声明 DPI 感知
 $script:DpiMode = [UiCap]::EnableDpiAwareness()

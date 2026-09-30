@@ -70,8 +70,8 @@ $ErrorActionPreference = 'Stop'
 #   HumanTick   最近一次"确认是真人干的"输入时刻
 $StatePath = Join-Path $env:TEMP 'dsh-ui-guard.json'
 
-if (-not ('InputGuard' -as [type])) {
-    Add-Type -TypeDefinition @'
+. (Join-Path $PSScriptRoot 'native.ps1')
+Import-NativeType -TypeName 'InputGuard' -Source @'
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -213,7 +213,7 @@ public class InputGuard
     }
 }
 '@
-}
+
 
 # ---------------------------------------------------------------- 状态文件
 function Read-State {

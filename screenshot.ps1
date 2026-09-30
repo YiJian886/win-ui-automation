@@ -60,8 +60,8 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 
-if (-not ('WinCap' -as [type])) {
-    Add-Type -TypeDefinition @'
+. (Join-Path $PSScriptRoot 'native.ps1')
+Import-NativeType -TypeName 'WinCap' -Source @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -137,7 +137,7 @@ public class WinCap
     }
 }
 '@
-}
+
 
 # 尽早声明 DPI 感知，务必在任何取坐标/抓屏之前调用
 $script:DpiMode = [WinCap]::EnableDpiAwareness()

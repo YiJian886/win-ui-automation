@@ -62,6 +62,21 @@
 .\ui.ps1 -Window '记事本' -ScrollAt '300,400' -Scroll -5
 ```
 
+### native.ps1 —— C# 编译缓存（内部用，不用直接调）
+
+三个脚本都靠 `Add-Type -TypeDefinition` 现场编译一段 C# 来调 Win32。实测编译一段
+263 行的 P/Invoke 类要 ~103 ms，而加载预编译好的 DLL 只要 ~22 ms。
+
+`native.ps1` 按源码内容做哈希，编好的 DLL 缓存在 `%LOCALAPPDATA%\win-ui-automation\native\`，
+下次直接加载。源码一改哈希就变，自动失效。
+
+实测收益：`ui.ps1 -List` 从 **468 ms 降到 420 ms（约 10%）**。说实话不大 ——
+批量模式下更是一次任务才省一次。属于"顺手做掉"级别的优化，不是架构性改进。
+
+顺带一个实测结论：加载 DLL **别用 `Add-Type -Path`**，它净开销 89 ms，
+比现场编译只快 14 ms，等于白折腾。用 `[System.Reflection.Assembly]::LoadFrom()`
+只要 22 ms，而且嵌套类型（`[UiCap+RECT]` 这种）照样能解析到。
+
 ### guard.ps1 —— 操作保护闸
 
 自动化跟人抢鼠标是很讨厌的事。`ui.ps1` 默认会先调它，确认真人已经有一段时间
@@ -318,6 +333,14 @@ $d = [int64]$Now - [int64]$Then
 if ($d -lt 0) { $d += 4294967296 }
 return [uint32]($d % 4294967296)
 ```
+
+### 12. 加载 DLL 别用 Add-Type -Path
+
+想把编译好的程序集缓存起来复用，第一反应是 `Add-Type -Path`。实测它的净开销
+**89 ms**，而现场重新编译也只要 103 ms —— 等于白折腾。
+
+换成 `[System.Reflection.Assembly]::LoadFrom($dll)` 只要 **22 ms**，
+而且嵌套类型也能被 `[TypeName]` 解析到。
 
 ## 类似的轮子
 
