@@ -109,6 +109,16 @@ param(
 
     [string]$OmniParserUrl = $(if ($env:OMNIPARSER_URL) { $env:OMNIPARSER_URL } else { 'http://127.0.0.1:7860' }),
 
+    # 批量模式：一串操作在一个进程里跑完，省掉每次调用的进程启动开销。
+    # 每行一条：动词 参数。见 .EXAMPLE 和 README。
+    [string[]]$Script,
+
+    [Parameter(ParameterSetName = 'Batch')]
+    [string]$ScriptFile,
+
+    [Parameter(ParameterSetName = 'Batch')]
+    [switch]$IgnoreErrors,
+
     # 操作保护：动手之前先确认真人已经静默这么多秒。0 = 关闭保护。
     [double]$GuardSeconds = 10,
 
@@ -370,6 +380,19 @@ public class UiCap
         if (!GetCursorPos(out p)) return "?";
         return p.X + "," + p.Y;
     }
+
+    // 记账要用：GetTickCount 取当前 tick，GetLastInputInfo 取"上次输入"的 tick
+    [DllImport("kernel32.dll")] public static extern uint GetTickCount();
+    [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+
+    public static uint LastInputTick()
+    {
+        LASTINPUTINFO li = new LASTINPUTINFO();
+        li.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+        if (!GetLastInputInfo(ref li)) return 0;
+        return li.dwTime;
+    }
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
 }
@@ -419,9 +442,36 @@ function Invoke-InputGuard {
         throw "操作保护：$GuardTimeout 秒内检测到你一直在用电脑，本次操作已中止。确认不用了可以加 -GuardSeconds 0 跳过。"
     }
 
-    # 放行之后立刻记账：把"我要注入了"这件事写进状态文件，
-    # 下次判断时才知道某次输入是自己干的还是真人干的。
-    try { & $guard -MarkInject -Quiet | Out-Null } catch { }
+}
+
+# 注入之前记账，告诉状态文件"接下来这几下是我干的"。
+# 必须紧挨着注入动作调用：中间隔太久的话，下次判断就会把这一下
+# 误认成真人操作，白白多等一整个静默期。
+function Set-InjectMark {
+    $statePath = Join-Path $env:TEMP 'dsh-ui-guard.json'
+    $now  = [UiCap]::GetTickCount()
+    $last = [UiCap]::LastInputTick()
+
+    $injectTick = [uint32]0
+    $humanTick  = [uint32]0
+    if (Test-Path $statePath) {
+        try {
+            $o = Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $injectTick = [uint32]$o.InjectTick
+            $humanTick  = [uint32]$o.HumanTick
+        } catch { }
+    }
+
+    # 上一次输入如果不在我上次记账之后的 600ms 内，那就不是自己刚发的，是真人。
+    # 这个窗口敢开这么小，是因为记账已经挪到紧挨注入了。
+    if ($last -ne 0 -and $injectTick -ne 0) {
+        $d = [int64]$last - [int64]$injectTick
+        if ($d -lt 0) { $d += 4294967296 }
+        if ($d -gt 600) { $humanTick = $last }
+    }
+
+    [pscustomobject]@{ InjectTick = $now; HumanTick = $humanTick } |
+        ConvertTo-Json -Compress | Set-Content -Path $statePath -Encoding UTF8
 }
 
 # ---------------------------------------------------------------- -List
@@ -464,16 +514,20 @@ if ($Activate) {
 }
 
 # ---------------------------------------------------------------- -Type
-if ($Type) {
+# 从原来的 -Type 块抽出来的，批处理模式和单次调用共用
+function Invoke-Type {
+
     Invoke-InputGuard
+    Set-InjectMark
     [UiCap]::TypeText($Type)
     Start-Sleep -Milliseconds $DelayMs
     [pscustomobject]@{ Typed = $Type; Length = $Type.Length }
     return
 }
 
-# ---------------------------------------------------------------- -Key
-if ($Key) {
+# 从原来的 -Key 块抽出来的，批处理模式和单次调用共用
+function Invoke-Key {
+
     Invoke-InputGuard
     $map = @{
         'enter'=13; 'tab'=9; 'esc'=27; 'escape'=27; 'space'=32; 'backspace'=8; 'delete'=46; 'del'=46
@@ -507,6 +561,7 @@ if ($Key) {
 
     # 逆序释放修饰键；用 try/finally 保证异常时也一定释放，
     # 否则会留下"卡住的修饰键"（按了下 Win 键不放 = 后续按键全变系统快捷键）
+    Set-InjectMark
     $reversed = @($codes)
     [array]::Reverse($reversed)
     try {
@@ -532,12 +587,14 @@ if ($Key) {
     return
 }
 
-# ---------------------------------------------------------------- -Drag
-if ($Drag) {
+# 从原来的 -Drag 块抽出来的，批处理模式和单次调用共用
+function Invoke-Drag {
+
     Invoke-InputGuard
     $p = Resolve-Point -Spec $Drag -Count 4
     [UiCap]::MoveTo($p[0], $p[1])
     Start-Sleep -Milliseconds 150
+    Set-InjectMark
     [UiCap]::MouseButton($false, $true)      # 左键按下并保持
     Start-Sleep -Milliseconds 100
 
@@ -557,10 +614,9 @@ if ($Drag) {
     return
 }
 
-# ---------------------------------------------------------------- -ScrollAt
-# 只移动光标 + 滚轮，不点击。用于在长列表（如评论区）里翻页，
-# 避免点击落在列表项上引发副作用。
-if ($ScrollAt) {
+# 从原来的 -ScrollAt 块抽出来的，批处理模式和单次调用共用
+function Invoke-ScrollAt {
+
     Invoke-InputGuard
     $pt = Resolve-Point -Spec $ScrollAt -Count 2
     $sx = $pt[0]; $sy = $pt[1]
@@ -578,6 +634,7 @@ if ($ScrollAt) {
         $sy = $w.Y + $sy
     }
 
+    Set-InjectMark
     [UiCap]::MoveTo($sx, $sy)
     Start-Sleep -Milliseconds 250
 
@@ -594,8 +651,9 @@ if ($ScrollAt) {
     return
 }
 
-# ---------------------------------------------------------------- -ClickAt
-if ($ClickAt) {
+# 从原来的 -ClickAt 块抽出来的，批处理模式和单次调用共用
+function Invoke-ClickAt {
+
     Invoke-InputGuard
     $pt = Resolve-Point -Spec $ClickAt -Count 2
     $x = $pt[0]; $y = $pt[1]
@@ -620,6 +678,7 @@ if ($ClickAt) {
         Start-Sleep -Milliseconds 400
     }
 
+    Set-InjectMark
     [UiCap]::MoveTo($x, $y)
     Start-Sleep -Milliseconds 120
 
@@ -641,10 +700,127 @@ if ($ClickAt) {
     return
 }
 
-# ---------------------------------------------------------------- 定位：控件树
-# 用 UI Automation 读窗口的控件树。靠谱的程序（Win32/WinUI/浏览器）都能读出
-# 带名字和精确坐标的控件；Electron 壳默认关掉辅助功能，树是空的 —— 那就得靠
-# 下面的视觉兜底。
+# 从原来的 -FindElement 块抽出来的，批处理模式和单次调用共用
+function Invoke-FindElement {
+
+    if (-not $Window) { throw '-FindElement 需要配 -Window 指定在哪个窗口里找。' }
+    $wins = Find-TargetWindow -Pattern $Window
+    if (-not $wins) { throw "没有匹配 '$Window' 的窗口。" }
+    $w = $wins[0]
+
+    $found = @()
+    $used = ''
+
+    if ($Strategy -ne 'vision') {
+        $found = @(Get-UiaElements -Handle $w.Handle -Pattern $FindElement)
+        if ($found.Count) { $used = 'uia' }
+    }
+    if (-not $found -and $Strategy -ne 'uia') {
+        $found = @(Get-VisionElements -Handle $w.Handle -Pattern $FindElement -Backend $VisionBackend -OmniUrl $OmniParserUrl)
+        if ($found.Count) { $used = "vision/$VisionBackend" }
+    }
+
+    if (-not $found) {
+        Write-Host "没找到匹配 '$FindElement' 的元素（策略=$Strategy）。"
+        Write-Host "控件树空的窗口（比如 Electron 壳）本来就读不到，试试 -Strategy vision。"
+        return
+    }
+
+    Write-Verbose "命中来源: $used"
+    $found | Select-Object Source, Type,
+        @{ n = 'Text'; e = { if ($_.Text.Length -gt 40) { $_.Text.Substring(0, 40) + '…' } else { $_.Text } } },
+        X, Y, W, H | Format-Table -AutoSize
+    return
+}
+
+# 从原来的 -ClickElement 块抽出来的，批处理模式和单次调用共用
+function Invoke-ClickElement {
+
+    Invoke-InputGuard
+    if (-not $Window) { throw '-ClickElement 需要配 -Window 指定在哪个窗口里点。' }
+    $wins = Find-TargetWindow -Pattern $Window
+    if (-not $wins) { throw "没有匹配 '$Window' 的窗口。" }
+    $w = $wins[0]
+
+    $fgNow = [UiCap]::GetForegroundWindow()
+    if ($fgNow -ne $w.Handle) {
+        [UiCap]::ForceActivate($w.Handle) | Out-Null
+        Start-Sleep -Milliseconds 400
+        $w = ([UiCap]::ListWindows($true) | Where-Object { $_.Handle -eq $w.Handle })
+    }
+
+    $target = $null
+    $used = ''
+
+    if ($Strategy -ne 'vision') {
+        $uia = @(Get-UiaElements -Handle $w.Handle -Pattern $ClickElement)
+        if ($uia.Count) {
+            # 排序：能被 Invoke 的优先 -> 文字完全同名的优先 -> 面积小的优先
+            # （面积小通常意味着控件更具体；页面上同名的大块文本容器会排在后面）
+            $want = $ClickElement -replace '\s+', ''
+            $ranked = $uia | Sort-Object -Property @(
+                @{ Expression = { if ($_.CanInvoke) { 0 } else { 1 } } },
+                @{ Expression = { if ($_.Norm -eq $want) { 0 } else { 1 } } },
+                @{ Expression = { $_.W * $_.H } }
+            )
+            $target = $ranked[0]
+            $used = 'uia'
+        }
+    }
+
+    if (-not $target -and $Strategy -ne 'uia') {
+        # 注意要套 @()：函数返回单元素数组时 PowerShell 会展开成标量，标量的 .Count 取不到值
+        $vis = @(Get-VisionElements -Handle $w.Handle -Pattern $ClickElement -Backend $VisionBackend -OmniUrl $OmniParserUrl)
+        if ($vis.Count) {
+            $target = ($vis | Sort-Object { $_.W * $_.H })[0]
+            $used = "vision/$($script:LastVisionBackend)"
+        }
+    }
+
+    if (-not $target) {
+        throw "找不到 '$ClickElement'（策略=$Strategy）。用 -FindElement 先看看窗口里有什么。"
+    }
+
+    # UIA 给的是屏幕绝对坐标；视觉识别给的是图片内坐标，得加窗口原点
+    if ($used -eq 'uia') {
+        $ax = $target.X; $ay = $target.Y
+    } else {
+        $ax = $w.X + $target.X; $ay = $w.Y + $target.Y
+    }
+
+    $clicked = 'click'
+    if ($used -eq 'uia' -and $target.CanInvoke) {
+        # 能 Invoke 就直接触发，比模拟点击稳（被遮挡也不怕）。
+        # Invoke 本身不算注入，但万一它失败要退回模拟点击，所以这里先记账。
+        Set-InjectMark
+        try {
+            $pattern = $target.Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            $pattern.Invoke()
+            $clicked = 'invoke'
+        } catch {
+            [UiCap]::MoveTo($ax, $ay)
+            Start-Sleep -Milliseconds 80
+            [UiCap]::Click($false, 1, 60)
+        }
+    } else {
+        Set-InjectMark
+        [UiCap]::MoveTo($ax, $ay)
+        Start-Sleep -Milliseconds 80
+        [UiCap]::Click($false, 1, 60)
+    }
+
+    Start-Sleep -Milliseconds $DelayMs
+    [pscustomobject]@{
+        Matched = $ClickElement
+        Via     = $used
+        How     = $clicked
+        Text    = $target.Text
+        Type    = $target.Type
+        At      = "$ax,$ay"
+    }
+    return
+}
+
 function Get-UiaElements {
     param([IntPtr]$Handle, [string]$Pattern)
 
@@ -709,9 +885,6 @@ function Get-UiaElements {
     return $out
 }
 
-# ---------------------------------------------------------------- 定位：视觉
-# 截图 + 识别（Windows 自带 OCR 或 OmniParser），按文字找元素。
-# 返回的坐标是相对截图的，调用方负责加上窗口原点。
 function Get-VisionElements {
     param([IntPtr]$Handle, [string]$Pattern, [string]$Backend, [string]$OmniUrl)
 
@@ -756,120 +929,222 @@ function Get-VisionElements {
     return @($parsed.elements)
 }
 
-# ---------------------------------------------------------------- -FindElement
-if ($FindElement) {
-    if (-not $Window) { throw '-FindElement 需要配 -Window 指定在哪个窗口里找。' }
-    $wins = Find-TargetWindow -Pattern $Window
-    if (-not $wins) { throw "没有匹配 '$Window' 的窗口。" }
-    $w = $wins[0]
+# ---------------------------------------------------------------- -Script / -ScriptFile
+# 批量模式：一串操作在同一个进程里顺序跑完。
+#
+# 为什么要这个：每次调用 ui.ps1 都要重新起一个 PowerShell 进程、重新编译那段 C#，
+# 实测每次固定开销约 0.4 秒。十步的任务光启动就浪费四秒。批量模式把这些省掉，
+# 顺带也让模型侧不用来回十几次。
+#
+# 格式：一行一条，`动词 参数`。空行和 # 开头的行忽略。
+if ($Script -or $ScriptFile) {
 
-    $found = @()
-    $used = ''
-
-    if ($Strategy -ne 'vision') {
-        $found = @(Get-UiaElements -Handle $w.Handle -Pattern $FindElement)
-        if ($found.Count) { $used = 'uia' }
-    }
-    if (-not $found -and $Strategy -ne 'uia') {
-        $found = @(Get-VisionElements -Handle $w.Handle -Pattern $FindElement -Backend $VisionBackend -OmniUrl $OmniParserUrl)
-        if ($found.Count) { $used = "vision/$VisionBackend" }
-    }
-
-    if (-not $found) {
-        Write-Host "没找到匹配 '$FindElement' 的元素（策略=$Strategy）。"
-        Write-Host "控件树空的窗口（比如 Electron 壳）本来就读不到，试试 -Strategy vision。"
-        return
+    # -Script 可以是一行数组，也可以是一整个多行字符串（命令行里传数组会被拆散，
+    # 所以多行字符串反而是更可靠的用法）
+    $lines = if ($ScriptFile) {
+        if (-not (Test-Path $ScriptFile)) { throw "找不到脚本文件: $ScriptFile" }
+        @(Get-Content $ScriptFile -Encoding UTF8)
+    } else {
+        @($Script | ForEach-Object { $_ -split "`r?`n" })
     }
 
-    Write-Verbose "命中来源: $used"
-    $found | Select-Object Source, Type,
-        @{ n = 'Text'; e = { if ($_.Text.Length -gt 40) { $_.Text.Substring(0, 40) + '…' } else { $_.Text } } },
-        X, Y, W, H | Format-Table -AutoSize
-    return
+    # 逐行可以切换目标窗口；命令行给的 -Window 作为初始值
+    $batchWindow = $Window
+    $batchIndex = 0
+    $batchFailed = 0
+
+    Write-Host "批量执行开始，共 $($lines.Count) 行"
+
+    foreach ($rawLine in $lines) {
+        $batchIndex++
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith('#')) { continue }
+
+        $sp = $line -split '\s+', 2
+        $verb = $sp[0].ToLower()
+        $arg = if ($sp.Count -gt 1) { $sp[1].Trim() } else { '' }
+
+        # 让被调用的函数看到当前的目标窗口
+        $Window = $batchWindow
+
+        try {
+            switch ($verb) {
+
+                'window' {
+                    $batchWindow = $arg
+                    Write-Host "  [$batchIndex] 目标窗口 -> $arg"
+                }
+
+                'activate' {
+                    $Window = $arg
+                    $wins = Find-TargetWindow -Pattern $arg
+                    if (-not $wins) { throw "没有匹配 '$arg' 的窗口" }
+                    [void][UiCap]::ForceActivate($wins[0].Handle)
+                    Start-Sleep -Milliseconds 350
+                    Write-Host "  [$batchIndex] 激活 $arg"
+                }
+
+                'click' {
+                    Set-Variable -Name ClickAt -Value $arg -Scope Script
+                    Set-Variable -Name DoubleClick -Value $false -Scope Script
+                    Set-Variable -Name RightClick -Value $false -Scope Script
+                    Invoke-ClickAt
+                    Write-Host "  [$batchIndex] click $arg"
+                }
+
+                'dblclick' {
+                    Set-Variable -Name ClickAt -Value $arg -Scope Script
+                    Set-Variable -Name DoubleClick -Value $true -Scope Script
+                    Set-Variable -Name RightClick -Value $false -Scope Script
+                    Invoke-ClickAt
+                    Write-Host "  [$batchIndex] dblclick $arg"
+                }
+
+                'rightclick' {
+                    Set-Variable -Name ClickAt -Value $arg -Scope Script
+                    Set-Variable -Name DoubleClick -Value $false -Scope Script
+                    Set-Variable -Name RightClick -Value $true -Scope Script
+                    Invoke-ClickAt
+                    Write-Host "  [$batchIndex] rightclick $arg"
+                }
+
+                'findelement' {
+                    Set-Variable -Name FindElement -Value $arg -Scope Script
+                    Invoke-FindElement
+                    Write-Host "  [$batchIndex] findelement $arg"
+                }
+
+                'clickelement' {
+                    Set-Variable -Name ClickElement -Value $arg -Scope Script
+                    Invoke-ClickElement | Out-Null
+                    Write-Host "  [$batchIndex] clickelement $arg"
+                }
+
+                'type' {
+                    Set-Variable -Name Type -Value $arg -Scope Script
+                    Invoke-Type | Out-Null
+                    Write-Host "  [$batchIndex] type $arg"
+                }
+
+                'key' {
+                    Set-Variable -Name Key -Value $arg -Scope Script
+                    Invoke-Key | Out-Null
+                    Write-Host "  [$batchIndex] key $arg"
+                }
+
+                'drag' {
+                    Set-Variable -Name Drag -Value $arg -Scope Script
+                    Invoke-Drag | Out-Null
+                    Write-Host "  [$batchIndex] drag $arg"
+                }
+
+                'scrollat' {
+                    # scrollat x,y 数量
+                    $bits = @($arg -split '\s+' | Where-Object { $_ -ne '' })
+                    if ($bits.Count -lt 3) { throw "scrollat 需要 x,y 和滚动格数，例如: scrollat 2025,600 -8" }
+                    Set-Variable -Name ScrollAt -Value $bits[0] -Scope Script
+                    Set-Variable -Name Scroll -Value ([int]$bits[1]) -Scope Script
+                    Invoke-ScrollAt | Out-Null
+                    Write-Host "  [$batchIndex] scrollat $($bits[0]) $($bits[1])"
+                }
+
+                'scroll' {
+                    # scroll 数量：在光标当前位置滚，不移动鼠标
+                    Invoke-InputGuard
+                    Set-InjectMark
+                    [UiCap]::Scroll([int]$arg)
+                    Write-Host "  [$batchIndex] scroll $arg"
+                }
+
+                'move' {
+                    Invoke-InputGuard
+                    Set-InjectMark
+                    $pt = Resolve-Point -Spec $arg -Count 2
+                    [UiCap]::MoveTo($pt[0], $pt[1])
+                    Write-Host "  [$batchIndex] move $arg"
+                }
+
+                'wait' {
+                    $sec = [double]$arg
+                    Start-Sleep -Milliseconds ([int]($sec * 1000))
+                    Write-Host "  [$batchIndex] wait $sec 秒"
+                }
+
+                'guard' {
+                    Set-Variable -Name GuardSeconds -Value ([double]$arg) -Scope Script
+                    Write-Host "  [$batchIndex] 操作保护阈值 -> $arg 秒"
+                }
+
+                'screenshot' {
+                    $ss = Join-Path $PSScriptRoot 'screenshot.ps1'
+                    $out = if ($arg) { $arg } else {
+                        $dir = Join-Path $PSScriptRoot 'shots'
+                        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+                        Join-Path $dir ("batch-{0}.png" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+                    }
+                    if ($batchWindow) { & $ss -Window $batchWindow -Out $out | Out-Null }
+                    else { & $ss -Out $out | Out-Null }
+                    Write-Host "  [$batchIndex] screenshot -> $out"
+                }
+
+                'echo' {
+                    Write-Host "  [$batchIndex] $arg"
+                }
+
+                default {
+                    throw "不认识的动词 '$verb'"
+                }
+            }
+        }
+        catch {
+            $batchFailed++
+            Write-Warning "第 $batchIndex 行失败（$line）: $($_.Exception.Message)"
+            if (-not $IgnoreErrors) {
+                Write-Host "批量执行中止于第 $batchIndex 行。要跳过错误继续跑，加 -IgnoreErrors。"
+                exit 1
+            }
+        }
+    }
+
+    if ($batchFailed -gt 0) {
+        Write-Host "批量执行结束，$batchFailed 行失败（已按 -IgnoreErrors 跳过）。"
+        exit 1
+    }
+    Write-Host "批量执行完成，$($lines.Count) 行全部处理。"
+    exit 0
 }
+
+if ($Type) { Invoke-Type; return }
+
+# ---------------------------------------------------------------- -Key
+if ($Key) { Invoke-Key; return }
+
+# ---------------------------------------------------------------- -Drag
+if ($Drag) { Invoke-Drag; return }
+
+# ---------------------------------------------------------------- -ScrollAt
+# 只移动光标 + 滚轮，不点击。用于在长列表（如评论区）里翻页，
+# 避免点击落在列表项上引发副作用。
+if ($ScrollAt) { Invoke-ScrollAt; return }
+
+# ---------------------------------------------------------------- -ClickAt
+if ($ClickAt) { Invoke-ClickAt; return }
+
+# ---------------------------------------------------------------- 定位：控件树
+# 用 UI Automation 读窗口的控件树。靠谱的程序（Win32/WinUI/浏览器）都能读出
+# 带名字和精确坐标的控件；Electron 壳默认关掉辅助功能，树是空的 —— 那就得靠
+# 下面的视觉兜底。
+
+
+# ---------------------------------------------------------------- 定位：视觉
+# 截图 + 识别（Windows 自带 OCR 或 OmniParser），按文字找元素。
+# 返回的坐标是相对截图的，调用方负责加上窗口原点。
+
+
+# ---------------------------------------------------------------- -FindElement
+if ($FindElement) { Invoke-FindElement; return }
 
 # ---------------------------------------------------------------- -ClickElement
-if ($ClickElement) {
-    Invoke-InputGuard
-    if (-not $Window) { throw '-ClickElement 需要配 -Window 指定在哪个窗口里点。' }
-    $wins = Find-TargetWindow -Pattern $Window
-    if (-not $wins) { throw "没有匹配 '$Window' 的窗口。" }
-    $w = $wins[0]
-
-    $fgNow = [UiCap]::GetForegroundWindow()
-    if ($fgNow -ne $w.Handle) {
-        [UiCap]::ForceActivate($w.Handle) | Out-Null
-        Start-Sleep -Milliseconds 400
-        $w = ([UiCap]::ListWindows($true) | Where-Object { $_.Handle -eq $w.Handle })
-    }
-
-    $target = $null
-    $used = ''
-
-    if ($Strategy -ne 'vision') {
-        $uia = @(Get-UiaElements -Handle $w.Handle -Pattern $ClickElement)
-        if ($uia.Count) {
-            # 排序：能被 Invoke 的优先 -> 文字完全同名的优先 -> 面积小的优先
-            # （面积小通常意味着控件更具体；页面上同名的大块文本容器会排在后面）
-            $want = $ClickElement -replace '\s+', ''
-            $ranked = $uia | Sort-Object -Property @(
-                @{ Expression = { if ($_.CanInvoke) { 0 } else { 1 } } },
-                @{ Expression = { if ($_.Norm -eq $want) { 0 } else { 1 } } },
-                @{ Expression = { $_.W * $_.H } }
-            )
-            $target = $ranked[0]
-            $used = 'uia'
-        }
-    }
-
-    if (-not $target -and $Strategy -ne 'uia') {
-        # 注意要套 @()：函数返回单元素数组时 PowerShell 会展开成标量，标量的 .Count 取不到值
-        $vis = @(Get-VisionElements -Handle $w.Handle -Pattern $ClickElement -Backend $VisionBackend -OmniUrl $OmniParserUrl)
-        if ($vis.Count) {
-            $target = ($vis | Sort-Object { $_.W * $_.H })[0]
-            $used = "vision/$($script:LastVisionBackend)"
-        }
-    }
-
-    if (-not $target) {
-        throw "找不到 '$ClickElement'（策略=$Strategy）。用 -FindElement 先看看窗口里有什么。"
-    }
-
-    # UIA 给的是屏幕绝对坐标；视觉识别给的是图片内坐标，得加窗口原点
-    if ($used -eq 'uia') {
-        $ax = $target.X; $ay = $target.Y
-    } else {
-        $ax = $w.X + $target.X; $ay = $w.Y + $target.Y
-    }
-
-    $clicked = 'click'
-    if ($used -eq 'uia' -and $target.CanInvoke) {
-        # 能 Invoke 就直接触发，比模拟点击稳（被遮挡也不怕）
-        try {
-            $pattern = $target.Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-            $pattern.Invoke()
-            $clicked = 'invoke'
-        } catch {
-            [UiCap]::MoveTo($ax, $ay)
-            Start-Sleep -Milliseconds 80
-            [UiCap]::Click($false, 1, 60)
-        }
-    } else {
-        [UiCap]::MoveTo($ax, $ay)
-        Start-Sleep -Milliseconds 80
-        [UiCap]::Click($false, 1, 60)
-    }
-
-    Start-Sleep -Milliseconds $DelayMs
-    [pscustomobject]@{
-        Matched = $ClickElement
-        Via     = $used
-        How     = $clicked
-        Text    = $target.Text
-        Type    = $target.Type
-        At      = "$ax,$ay"
-    }
-    return
-}
+if ($ClickElement) { Invoke-ClickElement; return }
 
 Write-Host "没有指定操作。用 -List / -Activate / -ClickAt / -Type / -Key / -Drag / -ScrollAt / -FindElement / -ClickElement，或看 .EXAMPLE"

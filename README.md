@@ -91,6 +91,54 @@
 .\ui.ps1 -Window '记事本' -ClickElement '保存' -GuardSeconds 5 -GuardTimeout 60
 ```
 
+### 批量模式：一次调用跑完一串操作
+
+每次调用 `ui.ps1` 都要重新起一个 PowerShell 进程、重新编译那段 C#，实测固定开销
+约 0.4 秒。十步的任务光启动就浪费四秒。批量模式把这些省掉，顺带也让调用方
+不用来回十几次。
+
+```powershell
+# 从文件读（推荐，多行好维护）
+.\ui.ps1 -ScriptFile .\steps.txt
+
+# 也可以直接塞多行字符串
+.\ui.ps1 -Script @"
+window 记事本
+activate 记事本
+click 900,600
+type 要搜索的内容
+key enter
+wait 2
+screenshot .\shots\result.png
+"@
+```
+
+一行一条，`动词 参数`，空行和 `#` 开头的行忽略：
+
+| 动词 | 例子 | 说明 |
+|---|---|---|
+| `window` | `window 记事本` | 切换后面操作的目标窗口 |
+| `activate` | `activate 记事本` | 还原 + 置前 + 抢焦点 |
+| `click` | `click 900,600` | 点窗口内相对坐标 |
+| `dblclick` | `dblclick 900,600` | 双击 |
+| `rightclick` | `rightclick 900,600` | 右键 |
+| `clickelement` | `clickelement 保存` | 按名字找控件再点（控件树优先，画面兜底） |
+| `findelement` | `findelement 评论` | 按名字找控件，只列出来 |
+| `type` | `type 你好` | 打字，中文直接打 |
+| `key` | `key ctrl+a` | 按键，支持组合 |
+| `drag` | `drag 100,100,400,400` | 拖拽 |
+| `scrollat` | `scrollat 2025,600 -8` | 移到指定位置再滚轮 |
+| `scroll` | `scroll -3` | 在光标当前位置滚 |
+| `move` | `move 500,300` | 只移动光标 |
+| `wait` | `wait 1.5` | 等 1.5 秒 |
+| `guard` | `guard 0` | 改操作保护阈值（0 = 关掉） |
+| `screenshot` | `screenshot a.png` | 截图 |
+| `echo` | `echo 到这里了` | 打一行日志 |
+
+默认遇到错误就中止并报出是第几行。要跳过错误继续跑，加 `-IgnoreErrors`。
+
+实测一个 12 步的任务：批量 **7.2 秒**，逐个调用 **11.6 秒**，省 37%。
+
 ### vision.ps1 —— 从画面里认元素
 
 ```powershell

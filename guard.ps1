@@ -258,8 +258,13 @@ function Get-HumanIdleMs {
     $last = [InputGuard]::LastInputTick()
 
     if (Test-LastInputIsOurs -State $st -LastTick $last) {
-        if ($st.HumanTick -eq 0) { return -1 }
-        return (Get-TickDelta -Now $now -Then $st.HumanTick)
+        if ($st.HumanTick -ne 0) {
+            return (Get-TickDelta -Now $now -Then $st.HumanTick)
+        }
+        # 没有真人输入的历史。但"最近一次输入是我自己注入的"这件事本身
+        # 就能推出一个可信下界：既然那之后没人碰过，真人至少从我记账那刻
+        # 起就静默了。没有这一条的话，状态文件刚建好时头两次调用会白等。
+        return (Get-TickDelta -Now $now -Then $st.InjectTick)
     }
     return (Get-TickDelta -Now $now -Then $last)
 }
